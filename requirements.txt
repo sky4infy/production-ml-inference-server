@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+transformers
+torch
+pydantic
+requests
+httpx
+onnxruntime
+onnx
