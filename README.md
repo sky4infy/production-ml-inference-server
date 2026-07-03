@@ -1,4 +1,4 @@
-# ML Inference Server — Phase 1
+# ML Inference Server — Phase 1...
 
 A FastAPI server that wraps a sentiment classification model and serves
 predictions over HTTP. This is the foundation phase: get it running and
