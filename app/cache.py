@@ -1,14 +1,8 @@
 """
-Redis cache layer — Phase 4.
+Redis cache layer — Phase 5 update.
 
-How it works:
-- Input text is hashed with SHA-256 to make a short, fixed-length cache key
-- Prediction result is stored as JSON with a 1-hour TTL
-- On Redis failure (down, timeout), always returns None (cache miss)
-  so the prediction path is NEVER broken by cache errors
-
-This file is synchronous (redis-py default).
-All calls from async endpoints go through asyncio.to_thread().
+Added: increments ml_cache_hits and ml_cache_misses Prometheus counters
+on every get() call. Everything else unchanged from Phase 4.
 """
 
 import hashlib
@@ -16,45 +10,41 @@ import json
 import os
 
 import redis
+from app.metrics import cache_hits, cache_misses
 
 REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379")
-TTL        = 3600          # 1 hour in seconds
-KEY_PREFIX = "ml:pred:"   # namespace prefix — isolates our keys from others
+TTL        = 3600
+KEY_PREFIX = "ml:pred:"
 
 
 def _client() -> redis.Redis:
-    """Create a Redis client from URL. Called fresh each time to avoid
-    stale connections — redis-py handles connection pooling internally."""
     return redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=1)
 
 
 def _make_key(text: str) -> str:
-    """SHA-256 hash of input text, prefixed.
-    Why hash: raw text as a key is slow, variable-length, and leaks data.
-    SHA-256 is deterministic — same text always gives same key."""
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"{KEY_PREFIX}{digest}"
 
 
 def get(text: str) -> dict | None:
     """
-    Returns cached result dict if found, None if miss or Redis is down.
-    Never raises — cache errors are always treated as misses.
+    Returns cached result if found, None if miss or Redis down.
+    Increments the appropriate Prometheus counter on every call.
     """
     try:
         raw = _client().get(_make_key(text))
         if raw:
+            cache_hits.inc()       # ← NEW: increment hit counter
             return json.loads(raw)
+        cache_misses.inc()         # ← NEW: increment miss counter
         return None
     except Exception:
-        return None   # Redis down or timeout → treat as miss
+        cache_misses.inc()         # ← Redis down counts as a miss
+        return None
 
 
 def set(text: str, result: dict) -> None:
-    """
-    Stores result in cache with TTL.
-    Silently ignores failures — a failed cache write is never a prediction error.
-    """
+    """Stores result in cache with TTL. Silently ignores failures."""
     try:
         _client().setex(_make_key(text), TTL, json.dumps(result))
     except Exception:
@@ -62,10 +52,7 @@ def set(text: str, result: dict) -> None:
 
 
 def stats() -> dict:
-    """
-    Returns cache statistics for the /health endpoint.
-    hit_rate is a rolling counter from Redis INFO — resets on Redis restart.
-    """
+    """Returns cache stats for /health endpoint."""
     try:
         info = _client().info("stats")
         hits   = info.get("keyspace_hits", 0)

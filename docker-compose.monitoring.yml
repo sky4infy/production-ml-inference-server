@@ -1,0 +1,36 @@
+version: "3.8"
+
+# Starts Prometheus + Grafana only.
+# Redis (redis-ml) is already running separately via docker run.
+# FastAPI server runs locally on port 8000, not in Docker yet (that's phase 7).
+#
+# Usage:
+#   docker-compose -f docker-compose.monitoring.yml up -d
+#   docker-compose -f docker-compose.monitoring.yml down
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      # Mount prometheus.yml from project root into container
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"   # keep 7 days of data
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    restart: unless-stopped

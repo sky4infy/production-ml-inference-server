@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s       # scrape /metrics every 15 seconds
+  evaluation_interval: 15s   # evaluate alert rules every 15 seconds
+
+scrape_configs:
+  - job_name: "ml-inference-server"
+    static_configs:
+      # host.docker.internal resolves to the Windows host machine IP
+      # from inside a Docker container. This is how Prometheus (running
+      # in Docker) reaches FastAPI (running locally on port 8000).
+      # Do NOT use localhost here — that would mean the container itself.
+      - targets: ["host.docker.internal:8000"]
+    metrics_path: "/metrics"
