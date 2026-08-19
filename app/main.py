@@ -9,6 +9,16 @@ What's new:
 - /metrics endpoint exposed for Prometheus to scrape every 15 seconds
 
 Everything else (ONNX backend, Redis cache, batcher) unchanged from phase 4.
+
+--- Phase 5 debugging fix (post-Prometheus) ---
+Benchmarking found the quantized ONNX INT8 model throws a
+DynamicQuantizeMatMul dimension-mismatch error for any batch size >= 2
+(works fine at batch=1). Since the batcher groups concurrent requests
+into batches of up to 8, sending it through ONNX crashed every batched
+request under load. ONNX INT8 was already measured slower than PyTorch
+for single requests on this CPU (no AVX-512 VNNI), so PyTorch is used
+for the batcher. ONNX INT8 remains available at /predict_onnx_unbatched
+for single-request comparison — see README for full writeup.
 """
 
 import asyncio
@@ -33,7 +43,12 @@ else:
                             get_classifier as onnx_load)
     print("[startup] ONNX model not found - using PyTorch backend")
 
-from app.model import predict as pytorch_predict, get_classifier as pytorch_load
+# predict_batch imported explicitly for the batcher — ONNX INT8 fails with
+# a DynamicQuantizeMatMul dimension mismatch for batch_size >= 2, so the
+# batcher must always use PyTorch regardless of ONNX_AVAILABLE.
+from app.model import (predict as pytorch_predict,
+                        predict_batch as pytorch_predict_batch,
+                        get_classifier as pytorch_load)
 from app.batcher import InferenceBatcher
 from app import cache
 
@@ -65,14 +80,14 @@ async def startup():
     pytorch_load()
     onnx_load()
     batcher = InferenceBatcher(
-        predict_fn=onnx_predict_batch,
+        predict_fn=pytorch_predict_batch,  # ← FIXED: was onnx_predict_batch
         batch_size=8,
         timeout_ms=20,
     )
     batcher.start()
 
-    backend = "ONNX INT8" if ONNX_AVAILABLE else "PyTorch"
-    print(f"[startup] /predict using {backend} + batching + Redis cache")
+    print("[startup] /predict using PyTorch + batching + Redis cache "
+          "(ONNX INT8 batch>=2 crashes with DynamicQuantizeMatMul error — see README)")
 
     s = cache.stats()
     if s["connected"]:
@@ -95,14 +110,14 @@ def health():
     return {
         "status"  : "ok",
         "version" : "0.5.0",
-        "backend" : "onnx_int8" if ONNX_AVAILABLE else "pytorch",
+        "backend" : "pytorch (batcher) + onnx_int8 (unbatched only)" if ONNX_AVAILABLE else "pytorch",
         "cache"   : cache.stats(),
     }
 
 
 @app.post("/predict", response_model=PredictResponse)
 async def predict(request: PredictRequest):
-    """Production path: Cache → Batcher → Cache write → Response."""
+    """Production path: Cache → Batcher (PyTorch) → Cache write → Response."""
     start = time.perf_counter()
 
     cached = await asyncio.to_thread(cache.get, request.text)
@@ -131,7 +146,8 @@ def predict_unbatched(request: PredictRequest):
 
 @app.post("/predict_onnx_unbatched", response_model=PredictResponse)
 def predict_onnx_unbatched(request: PredictRequest):
-    """ONNX INT8, no batcher, no cache. Direct inference benchmarking."""
+    """ONNX INT8, no batcher, no cache. Single-request only — batching
+    this backend crashes (DynamicQuantizeMatMul dimension mismatch)."""
     start = time.perf_counter()
     result = onnx_predict(request.text)
     return {**result, "latency_ms": round((time.perf_counter() - start) * 1000, 2)}
