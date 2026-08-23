@@ -2,8 +2,13 @@
 
 A FastAPI server that wraps a DistilBERT sentiment classifier and serves
 predictions over HTTP: request batching, ONNX INT8 quantization, Redis
-caching, and Prometheus/Grafana metrics — each phase measured before the
-next was added.
+caching, a circuit breaker on the model path, and Prometheus/Grafana metrics
+— each phase measured before the next was added. Phase 7b puts the whole
+stack behind one `docker compose up`.
+
+```bash
+docker compose up -d --build
+```
 
 Phases 1–2 below are the original build notes. **Phase 6 documents four
 findings from phases 3–5 that turned out to be measurement artifacts**, and
@@ -11,6 +16,92 @@ what the harness now prints so they cannot recur; read it before trusting
 any number in the earlier sections. Phase 5 gets the same treatment for the
 Grafana dashboard, where four of the five panel values turn out to be
 properties of the PromQL query rather than of the server.
+
+## Architecture
+
+```
+HTTP request
+     │
+     ▼
+FastAPI  (one uvicorn worker, async)
+     │
+     ├─► GET  /health    backend, cache and breaker status
+     ├─► GET  /metrics   Prometheus scrape target
+     │
+     │  POST /predict
+     ▼
+Redis cache-aside   SHA-256 key, 1h TTL
+     │
+     ├─► hit ─────────────────────────────────► ~0.7 ms, model never touched
+     │
+     ▼ miss
+Circuit breaker gate      CLOSED     admit
+  checked before the      OPEN       503 in 0.015 ms, model never called
+  queue, not around       HALF_OPEN  exactly one probe admitted
+  the model call
+     │
+     ▼
+Request batcher  (asyncio.Queue)
+  batch_size=8, 20 ms collection window, ≤4 concurrent batches
+     │
+     ▼
+ONNX Runtime INT8 — DistilBERT SST-2
+  backend resolved at startup by a real batch-of-2 probe;
+  PyTorch FP32 if that probe fails
+     │
+     ▼
+observes ml_batch_size, ml_model_inference_seconds
+     │
+     ▼
+/metrics ──► Prometheus (15 s scrape) ──► Grafana
+
+POST /predict_unbatched       PyTorch FP32 — no cache, no batcher, no breaker
+POST /predict_onnx_unbatched  ONNX INT8   — no cache, no batcher, no breaker
+     documented baseline arms for the benchmarks below, not serving paths
+```
+
+| Layer | Choice |
+|---|---|
+| API | FastAPI + uvicorn, one worker deliberately |
+| Model | `distilbert-base-uncased-finetuned-sst-2-english` |
+| Inference | ONNX Runtime INT8 dynamic quantization, PyTorch FP32 fallback |
+| Cache | Redis 7, cache-aside, SHA-256 keys, 1 h TTL, singleton client |
+| Reliability | consecutive-failure circuit breaker, checked at admission |
+| Observability | `prometheus-fastapi-instrumentator` + 6 custom metrics, Grafana |
+| Packaging | Docker Compose — `app`, `redis`, `prometheus`, `grafana` |
+| Python | 3.13 — host venv and image both, so the container matches the process every number was measured on |
+
+## Project structure
+
+```
+.
+├── app/
+│   ├── main.py              FastAPI app — startup backend probe, routes, /health
+│   ├── model.py             PyTorch FP32 backend — baseline and fallback
+│   ├── model_onnx.py        ONNX INT8 backend, pads to batch-longest
+│   ├── batcher.py           InferenceBatcher — queue, 20 ms window, Semaphore(4)
+│   ├── circuit_breaker.py   admission gate — CLOSED / OPEN / HALF_OPEN
+│   ├── cache.py             Redis cache-aside, module-level singleton client
+│   └── metrics.py           the 6 custom Prometheus metrics
+├── models/                  gitignored — built by export_onnx.py, or at image build
+│   ├── model_fp32.onnx      (+ model_fp32.onnx.data sidecar, 256 MB)
+│   └── model_int8.onnx      64.7 MB — the only graph that ships
+├── export_onnx.py           export + INT8 quantize; validates the batch axis
+├── benchmark_onnx.py        ONNX vs PyTorch over HTTP, interleaved arms
+├── benchmark_batch_sizes.py in-process per-item cost by batch size
+├── load_test.py             4 arms — PyTorch, ONNX, cold cache, warm cache
+├── load_test_nocache.py     batching in isolation, cache bypassed
+├── test_requests.py         phase 1 smoke test
+├── test_cache.py            hit rate + speedup, calibrated per machine
+├── test_circuit_breaker.py  state machine — unit, integration, live
+├── Dockerfile               builder exports the graph; runtime is 3.13-slim
+├── docker-compose.yml       app, redis, prometheus, grafana on one network
+├── prometheus.yml           scrapes app:8000/metrics every 15 s
+├── docs/
+│   └── grafana-dashboard.png  the 5 panels under sustained load
+├── requirements.txt         unpinned, for host work
+└── requirements.lock.txt    pinned — what the image actually installs
+```
 
 ## Phase 1: baseline
 
@@ -190,7 +281,7 @@ so repeated inputs never need a second forward pass. `app/cache.py` keys on
 `sha256(text)` with a 1-hour TTL.
 
 ```bash
-docker run -d -p 6379:6379 redis:alpine
+docker compose up -d redis     # was: docker run -d -p 6379:6379 redis:alpine
 python test_cache.py
 ```
 
@@ -221,16 +312,20 @@ adds automatically, plus four custom ones from `app/metrics.py`:
 
 The last two are observed **inside the batcher, once per batch**. So they
 describe batches rather than requests, and they are blind to everything the
-cache served and to both unbatched endpoints.
+cache served and to both unbatched endpoints. (Phase 7a adds two more,
+`ml_circuit_breaker_state` and `ml_circuit_breaker_rejections`.)
 
 ```bash
-docker compose -f docker-compose.monitoring.yml up -d
+docker compose up -d prometheus grafana
 # Grafana at localhost:3000 (admin/admin), Prometheus at localhost:9090
 ```
 
-Prometheus runs in Docker and the server does not, so `prometheus.yml`
-targets `host.docker.internal:8000` rather than `localhost` — inside a
-container `localhost` is the container. Scrape interval 15 s, retention 7 d.
+Prometheus runs in Docker and the server did not, so `prometheus.yml` targeted
+`host.docker.internal:8000` rather than `localhost` — inside a container
+`localhost` is the container. (Phase 7b moved the server into Docker too, so the
+target is now the compose service name `app:8000`; the old line is kept
+commented in `prometheus.yml` for host-run development.)
+Scrape interval 15 s, retention 7 d.
 Target health over the retained window: **511 scrapes, up, mean scrape
 duration 8.97 ms** (max 185 ms, on the cold first scrape). Serving `/metrics`
 costs the server 5.11 ms, or 0.03% of a 15-second interval.
@@ -339,14 +434,15 @@ harness, which times it directly. (`histogram_quantile` is not the fix — it
 does not apply to counters.)
 
 **The flat lines are the rate window, not stability.** Every panel in the
-screenshots holds one value dead flat for five minutes and is empty for the
-other 5h 55m. That is a 5-minute rate window republishing a single scrape's
-delta at every step until the delta ages out. There is one measurement per
-panel, so a flat line here cannot show that the model is not degrading, that
-there is no memory leak, or that there is no thermal throttling. Phase 6's
-E-core finding — one identical PyTorch call recorded at 17.8 ms in one phase
-and 31.7 ms in another — is exactly the drift this chart is too sparse to
-see.
+phase 5 screenshots (taken during that session, not the sustained-load
+capture further down) holds one value dead flat for five minutes and is
+empty for the other 5h 55m. That is a 5-minute rate window republishing a
+single scrape's delta at every step until the delta ages out. There is one
+measurement per panel, so a flat line here cannot show that the model is
+not degrading, that there is no memory leak, or that there is no thermal
+throttling. Phase 6's E-core finding — one identical PyTorch call recorded
+at 17.8 ms in one phase and 31.7 ms in another — is exactly the drift this
+chart is too sparse to see.
 
 ### What the dashboard did establish
 
@@ -381,6 +477,41 @@ from quantiles:
 5. Put `ml_batch_size_count` and `ml_model_inference_seconds_count` on the
    dashboard beside every percentile derived from them. A p99 over 7 samples
    should look wrong at a glance.
+
+### The dashboard, re-captured under sustained load
+
+![Grafana dashboard under sustained load](docs/grafana-dashboard.png)
+
+This is the same five panels, captured against the Phase 7b compose stack
+(note `instance="app:8000"`) with recommendation 4 above actually applied:
+load ran continuously for longer than the widest rate window instead of in
+two bursts, so the lines carry shape rather than republishing one scrape's
+delta. Read off it directly — model inference p99 climbing 0.25 s → 0.39 s
+as the queue fills, batch size p95 pinned at 7.61–7.65 against a cap of 8,
+`/predict` steady at ~13.5 req/s alongside ~9 req/s on each unbatched
+endpoint.
+
+Three caveats that matter more than the picture:
+
+- **The cache hit rate is a property of the harness, not of production.**
+  The load alternates `load_test_nocache.py` (unique texts, guaranteed
+  misses) with `load_test.py` (five rotating texts, near-total hits), so
+  60–83% is the mix I chose in order to keep the model panels fed. An
+  earlier attempt at this screenshot left three panels empty for exactly
+  this reason: `load_test.py` alone primes the cache on its first loop and
+  every subsequent loop is served from Redis, so the model saw **9 forward
+  passes against 6886 requests** and there was nothing to plot.
+- **The model-inference drop at the right edge is the cache, not
+  recovery.** Cache hit rate rises into the 80s over the same interval; the
+  batcher was simply handling less work per batch.
+- **Request Rate was blank until a dashboard bug was fixed.** Panel 1
+  carried a saved `hideSeriesFrom` override pinned to
+  `instance="host.docker.internal:8000"`. Containerizing the app in Phase
+  7b changed that label to `app:8000`, so an exclude-all-but-that-instance
+  override hid every series from the plot while the legend still listed
+  them — a panel that looks like "no data" and is really "no data
+  *matching a filter you cannot see*". Worth noting as a class of bug:
+  moving a deployment renames labels, and dashboards store label matchers.
 
 ## Phase 6: fixing the benchmarks — four wrong conclusions
 
@@ -608,13 +739,339 @@ counter-derived figures only, since the quantile panels are bucket artifacts:
 | `/predict_unbatched` mean | 522.51 ms | 400 requests, 50-way load |
 | Errors | 0 / 1693 | `http_requests_total` by status |
 
+## Phase 7a: circuit breaker
+
+When the model backend starts failing for real — a dead ONNX session, OOM, a
+graph swapped out from under the process — the worst thing the server can do is
+keep feeding it work. Every doomed request still costs a queue slot, a batch
+collection window, a semaphore permit and a threadpool hop before it fails, so a
+broken backend turns into a growing backlog of requests that are all going to
+error anyway.
+
+`app/circuit_breaker.py` stops that. Five consecutive failed batches and the
+server stops calling the backend at all; after a 30-second cooldown, exactly one
+request is let through to find out whether it recovered.
+
+```
+CLOSED ──5 consecutive failed batches──► OPEN ──30s elapsed──► HALF_OPEN
+   ▲                                       ▲                      │
+   └───────────── probe succeeds ──────────┴── probe fails ────────┘
+```
+
+### The check is at admission, not around the model call
+
+Both build plans specify the textbook shape — `breaker.call(fn, *args)` wrapping
+the protected call, which puts the check inside `InferenceBatcher._run_batch()`.
+That call site cannot deliver what the same documents ask for a few paragraphs
+later: `/predict` returning 503 "immediately (not after a full batch timeout)".
+By the time `_run_batch()` runs, the request has already sat in the queue and
+paid up to the 20 ms collection window. A rejection that costs 20 ms and still
+lets the queue grow is not fast-failing.
+
+So the breaker is a gate, not a wrapper, and permission and outcome are separate
+calls because they happen at different points in a request's life:
+
+- `predict()` in `app/batcher.py` calls `check()` **before** `queue.put()`
+- `_run_batch()` calls `record_success()` / `record_failure()` once the outcome
+  is actually known
+
+Measured cost of a rejection on that path: **0.015 ms**, against the 20 ms window
+it would have paid at the other call site. That assertion lives in the test suite
+rather than in this file, because it is the one measurement that would catch the
+check drifting back into `_run_batch()`.
+
+### HALF_OPEN admits exactly one request
+
+The plan doc's state diagram says "let ONE request through as a probe" and its
+code does not do that: once the `state` property flips OPEN→HALF_OPEN, every
+subsequent caller sees a non-OPEN state and proceeds. At any real request rate
+that stampedes a backend which has just been given one chance. The fix is an
+explicit in-flight token, claimed by whichever request becomes the probe.
+
+`_refresh()` — the time-based OPEN→HALF_OPEN flip — is deliberately called by
+`status()` as well, but `status()` never claims the token. Otherwise polling
+`/health` would consume the one probe the cooldown just earned, and the backend
+would never actually get tested.
+
+Because everyone else is rejected while HALF_OPEN, `_collect_batch()` finds a
+single item: the probe batch is naturally size 1, risking one request rather
+than eight.
+
+### The threshold counts batches, not requests
+
+One batch is one `predict_fn` call, so `failure_threshold=5` is five consecutive
+failed *batches* — up to 40 failed requests at `batch_size=8`. Counting
+per-request would open the breaker on one bad batch, which is too twitchy for a
+batching server.
+
+Two limits worth stating rather than engineering around:
+
+1. **It is a consecutive-failure breaker.** Any success resets the count, so a
+   backend failing 50% of the time will never trip it. Catching that needs a
+   rolling error-rate window — a different design, and not what either build plan
+   specifies.
+2. **`/predict_unbatched` and `/predict_onnx_unbatched` stay unprotected.** They
+   bypass the batcher by design; they are the documented baseline arms for the
+   benchmarks above, not serving paths.
+
+### Cached predictions survive an open breaker
+
+`/predict` is cache-then-batcher, and the gate lives inside `batcher.predict()`,
+so cache hits never reach it. When the model is down the server keeps answering
+everything it has already answered, and only misses get shed.
+
+### No lock
+
+`check()`, `record_success()` and `record_failure()` all run on the single
+asyncio event loop and none of them contains an `await`, so each runs to
+completion without yielding and they are already atomic with respect to each
+other. The plan doc carries an `asyncio.Lock`; it implies a race that cannot
+happen. The one real await on this path — `asyncio.to_thread(predict_fn, ...)` —
+is *before* the bookkeeping, not inside it.
+
+Relatedly, `asyncio.CancelledError` is a `BaseException`, so `_run_batch()`'s
+`except Exception` does not catch it, and `stop()` cancelling the worker at
+shutdown is therefore not recorded as a model failure. That is load-bearing,
+which is why there is a comment there telling the next reader not to widen it.
+
+### Nothing in `/predict` changed
+
+`CircuitOpenError` subclasses `RuntimeError`, and `/predict` already had
+
+```python
+try:
+    result = await batcher.predict(request.text)
+except RuntimeError as e:
+    raise HTTPException(status_code=503, detail=str(e))
+```
+
+so the 503 path needed no edit at all — the plan doc lists it as a modification
+and it isn't one. Being its own class still lets tests tell a breaker rejection
+apart from a genuine batcher error.
+
+### Testing it without editing production code
+
+The plan doc's testing note concedes its own approach doesn't work: "the model
+won't actually fail on ordinary bad input — temporarily set `failure_threshold=1`
+and manually raise Exception in `_run_batch`, then revert." That needs hand edits
+to shipping code and proves nothing repeatable.
+
+`test_circuit_breaker.py` injects a failing `predict_fn` instead — no server, no
+temporary edits, and no permanent test hook that could trip in production:
+
+```bash
+python test_circuit_breaker.py
+```
+
+1. **Unit** — the state machine against a fast breaker (`failure_threshold=2`,
+   `cooldown_seconds=0.5`): opens at threshold, rejects while OPEN, cooldown
+   yields HALF_OPEN, `status()` polling does not consume the probe, a second
+   concurrent caller is rejected while the probe is in flight, probe success
+   closes it, probe failure reopens it and restarts the cooldown.
+2. **Integration** — a real `InferenceBatcher` with a `predict_fn` that raises.
+   Drives `.predict()` until it opens, asserts the backend was called exactly
+   twice and not once more after that, and times the rejection against the 20 ms
+   window. Then swaps in a working `predict_fn` and confirms exactly one of two
+   concurrent requests becomes the probe and closes the breaker.
+3. **Live** — `/health`, `/predict` and `/metrics` against a running server;
+   skipped with a printed note if port 8000 is not answering, so the script is
+   useful either way.
+
+`/health` gains the breaker's state, and it is on the metrics path too:
+
+```json
+"circuit_breaker": {"state": "closed", "failure_count": 0, "threshold": 5,
+                    "cooldown_seconds": 30, "rejections": 0}
+```
+
+```
+ml_circuit_breaker_state 0.0              # 0=closed, 1=half_open, 2=open
+ml_circuit_breaker_rejections_total 0.0
+```
+
+The gauge exists because `/health` only reports when something polls it: a
+breaker that opened and recovered between two polls leaves no trace there, which
+is exactly the class of invisible event phase 5 existed to fix. `rejections` is
+kept separate from the 503s in `http_requests_total` — a request rejected here
+never reached the model, so it is load shed on purpose rather than a server
+error. A Grafana panel for the gauge is not wired up; that belongs with the
+provisioning-as-code work still open from 7b.
+
+### What was not re-measured
+
+The breaker adds one branch per uncached request, and `load_test_nocache.py`
+cannot resolve that on this box. Two host runs after the change, plus the
+container:
+
+| Run | ONNX INT8, no batcher | ONNX INT8 + batcher | verdict |
+|---|---|---|---|
+| host 1 | 108.0 req/s | 150.4 req/s | 1.39x |
+| host 2 | 124.7 req/s | 87.8 req/s | 0.70x |
+| container | 91.9 req/s | 110.5 req/s | 1.20x |
+
+The batched arm moves 87.8 → 150.4 across two runs of the same script at N=200,
+so the noise floor here is far wider than a branch. The unbatched arm carries no
+breaker code at all and swings by the same order, which is the isolation
+argument that matters: whatever is moving these numbers is not the breaker.
+
+All three rows are also well below the 313.2 / 314.6 req/s recorded in phase 6
+above, on code whose ONNX path is unchanged by this phase — so that gap is
+machine state, not this change, and none of these numbers are a re-baseline.
+Re-baselining stays deferred, as it was in 7b.
+
+## Phase 7b: containerization
+
+`docker compose up -d --build` starts the whole stack. Before this phase, running
+the project meant three separate things — `docker run` for Redis, a partial
+compose file for Prometheus and Grafana, and `uvicorn` on the host — and the
+server being outside Docker is the only reason `prometheus.yml` had to scrape
+`host.docker.internal:8000`. It now targets the compose service name `app:8000`.
+
+| Service | Port | Image |
+|---|---|---|
+| `app` | 8000 | built from `Dockerfile` — 975 MB |
+| `redis` | 6379 | `redis:7-alpine` |
+| `prometheus` | 9090 | `prom/prometheus:v2.51.0` |
+| `grafana` | 3000 | `grafana/grafana:10.4.0` |
+
+### The ONNX export runs during `docker build`
+
+`models/` is gitignored, so a clean clone has no graph — and what the server does
+about that is the actual problem. `app/main.py:53` is
+
+```python
+ONNX_AVAILABLE = Path("models/model_int8.onnx").exists()
+```
+
+A missing graph is therefore not an error. The server starts, reports healthy,
+and serves every request on the PyTorch backend at 2.56x the latency, with
+nothing anywhere saying so. The same happens if the process is launched from the
+wrong working directory, because that path is relative — which is why the
+runtime stage pins `WORKDIR /app` and keeps the graph at `/app/models/`.
+
+So the builder stage runs `export_onnx.py` and the runtime stage copies the
+result out. Two things follow:
+
+- **The export's own checks become build failures.** The script requires the
+  logits batch axis to be symbolic and runs real batch-1 and batch-4
+  predictions, exiting non-zero on either. The phase 3 bug — a graph specialized
+  to batch 1, which passes a batch-1 smoke test and dies at batch 2 — can no
+  longer be built into an image. From this build:
+
+  ```
+  logits output shape: ['batch_size', 2]
+  batch=1: shape=(1, 2)  labels=['POSITIVE']  OK
+  batch=4: shape=(4, 2)  labels=['POSITIVE', 'NEGATIVE', 'POSITIVE', 'NEGATIVE']  OK
+  Done. 256.2 MB → 64.7 MB  (75% smaller, 4.0x)
+  ```
+
+- **Only the INT8 graph ships.** `app/model_onnx.py` never opens the FP32 one —
+  that is `benchmark_batch_sizes.py`'s comparison arm — so 256 MB of
+  `model_fp32.onnx.data` stays behind in the builder. The trade-off is that that
+  benchmark's FP32 arm cannot run inside the container.
+
+`.dockerignore` excludes `models/` alongside `venv/`, so a local build takes the
+same path a clean clone does instead of silently picking up the host's graphs.
+The Hugging Face snapshot is baked in at `HF_HOME=/opt/hf` with
+`HF_HUB_OFFLINE=1`, so startup does no network I/O and a cache-layout mistake
+fails loudly rather than re-downloading 260 MB per container start.
+
+### torch, installed twice, in that order
+
+`pip install torch` on Linux resolves to the CUDA build: roughly 2.5 GB of
+`nvidia-*` wheels for a model capped at two threads by `torch.set_num_threads(2)`.
+The Dockerfile installs `torch==2.12.1` from `download.pytorch.org/whl/cpu`
+**before** the lock file, as its own step, because both indexes publish 2.12.1
+and letting pip choose between them is not deterministic. The lock file then
+finds torch already satisfied and leaves it alone. The container confirms it:
+`torch 2.12.1+cpu`.
+
+torch cannot just be dropped to shrink the image. `app/main.py` imports
+`app.model` unconditionally — it backs `/predict_unbatched`, the baseline arm in
+every benchmark here, and it is the fallback when the batch probe fails.
+
+Versions are pinned in `requirements.lock.txt`; `requirements.txt` stays unpinned
+for host work. This matters because the phase 6 findings are properties of
+specific versions rather than of the code: the padding fix rests on tokenizer
+behaviour, the batch-axis bug is `torch.onnx.export`'s `dynamo=True` default, and
+the `quantize_dynamic` shape-inference conflict is onnxruntime 1.27.
+
+### One worker, deliberately
+
+The container runs a single uvicorn worker. The batcher is in-process, so N
+workers means N independent batchers each filling at 1/N the request rate, and
+N × `Semaphore(4)` × 2 intra-op threads competing for 12 — which is the
+oversubscription phase 6 just removed. Multiple workers would also split the
+Prometheus registry, so `/metrics` would describe one arbitrary worker and every
+counter in the phase 5 writeup would silently become a fraction.
+
+The known cost is the event-loop ceiling phase 6 measured: HTTP parsing and
+pydantic validation for every connection on one thread, which is why req/sec
+stops tracking code speed once a handler drops below a few ms. Scaling that out
+needs `PROMETHEUS_MULTIPROC_DIR` and a batcher that does not assume one process.
+Both are deferred rather than guessed at.
+
+### The startup log is the verification step
+
+All three ways this can fail quietly show up here and nowhere else — each of them
+serves traffic successfully, so a 200 from `/health` proves nothing:
+
+```
+[startup] ONNX INT8 backend detected                 <- relative path resolved
+[startup] /predict = onnx_int8 + batching (<=4 concurrent batches) + Redis cache
+          + circuit breaker                          <- 2-row batch probe passed
+[startup] Redis connected OK                         <- reached redis:6379
+```
+
+`ONNX model not found` means the graph or the working directory is wrong.
+`ONNX batch probe FAILED` means the graph is batch-specialized. `WARNING: Redis
+not reachable` means the cache is failing open and every request is going to the
+model — the phase 4 regression, in a form that looks like a healthy server.
+
+`/health` then reports `"backend": "onnx_int8 (batcher)"`, and the metrics
+pipeline can be checked end to end: three identical POSTs to `/predict` produced
+`ml_cache_misses_total 1`, `ml_batch_size_count 1`, `ml_cache_hits_total 2` in
+Prometheus, with the target at `http://app:8000/metrics`, `up`.
+
+### Two caveats on numbers from the container
+
+Nothing in this phase was re-baselined, and the earlier sections' figures are
+host measurements. Two reasons not to compare them directly:
+
+1. **Docker Desktop on Windows runs under WSL2**, a VM with its own scheduling
+   and network stack. Server-side, a cache hit in the container measures 0.70 ms
+   against 0.85 ms on the host, and a cold `/predict` 32.6 ms — the same order,
+   but not the same machine.
+2. **The published-port hop is not free.** `test_cache.py` from the host passes
+   (6.42x hit speedup, hit counters agreeing) but reports hits at ~7 ms
+   client-side for what the handler itself measured at 0.7 ms. That gap is the
+   port forward, and it is exactly the client-vs-server confusion phase 6 added
+   both numbers to make visible.
+
+Re-baselining inside the container, and parameterizing the five test scripts'
+hardcoded `127.0.0.1:8000`, are not part of this phase.
+
+### Grafana state now survives a teardown
+
+The pre-phase-7 Grafana container had no volume, so the phase 5 dashboard lived
+in its writable layer and any `docker rm` would have destroyed it. Compose now
+mounts a named `grafana-data` volume; the dashboard and its datasource were
+exported over the API and re-imported, and verified to survive
+`docker compose down && docker compose up -d`. Provisioning them from files —
+and applying phase 5's five bucket and rate-window fixes — is still open.
+
 ### Running everything
 
 ```bash
-docker run -d -p 6379:6379 --name redis-ml redis:alpine
-docker compose -f docker-compose.monitoring.yml up -d
-uvicorn app.main:app --reload
+docker compose up -d --build
+docker compose logs -f app        # watch the backend probe resolve
 ```
+
+Grafana at `localhost:3000` (admin/admin), Prometheus at `localhost:9090`,
+the server at `localhost:8000`.
+
+The benchmarks and load tests still run from the host against the published
+port, in the venv:
 
 ```bash
 python benchmark_batch_sizes.py   # in-process: PyTorch vs INT8 vs FP32, per batch size
@@ -622,7 +1079,14 @@ python benchmark_onnx.py          # over HTTP, interleaved, no batcher, no cache
 python load_test.py               # concurrency: uncached, cold cache, warm cache
 python load_test_nocache.py       # batching in isolation, cache bypassed
 python test_cache.py              # cache hit rate + relative speedup
+python test_circuit_breaker.py    # breaker state machine; last section needs the server
 ```
+
+`benchmark_batch_sizes.py` runs the model in-process rather than over HTTP, so it
+needs the venv and both graphs on the host — including the FP32 one the container
+image omits. For a fast edit loop on the server itself, `uvicorn app.main:app
+--reload` on the host still works; switch `prometheus.yml` to the
+`host.docker.internal:8000` target kept commented there.
 
 The dashboard panels only carry signal while load is running, and a full
 four-arm `load_test.py` run is over in about 30 seconds — two or three
