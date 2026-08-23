@@ -39,6 +39,16 @@ AVX-512 VNNI)". Both conclusions were wrong. Measured:
 
 The batcher now uses ONNX INT8, chosen at startup by an actual batch probe
 rather than a hardcoded assumption — see _onnx_batch_is_safe().
+
+--- Phase 7a ---
+
+A circuit breaker guards the model path. Five consecutive failed batches and
+/predict stops calling the backend entirely, rejecting at admission instead of
+queueing more doomed work; after a 30s cooldown one probe request tests
+recovery. Cache hits are unaffected, because the gate lives inside
+batcher.predict() and /predict checks Redis first — so a dead model still serves
+everything it has already answered. State is in /health and at
+ml_circuit_breaker_state. See app/circuit_breaker.py.
 """
 
 import asyncio
@@ -70,6 +80,7 @@ from app.model import (predict as pytorch_predict,
                         predict_batch as pytorch_predict_batch,
                         get_classifier as pytorch_load)
 from app.batcher import InferenceBatcher
+from app.circuit_breaker import CircuitBreaker
 from app import cache
 
 # ── App setup ────────────────────────────────────────────────────────────────
@@ -139,11 +150,17 @@ async def startup():
         batch_size=8,
         timeout_ms=20,
         max_concurrent_batches=4,   # was effectively 1 — see app/batcher.py
+        # Constructed here rather than inside InferenceBatcher so the breaker's
+        # tuning sits next to the batcher's, which is where a reader looks for
+        # it. 5 counts consecutive failed *batches*, not requests — one batch is
+        # one predict_fn call, so at batch_size=8 that is up to 40 failed
+        # requests before the breaker opens.
+        circuit_breaker=CircuitBreaker(failure_threshold=5, cooldown_seconds=30),
     )
     batcher.start()
 
     print(f"[startup] /predict = {BATCHER_BACKEND} + batching "
-          f"(<=4 concurrent batches) + Redis cache")
+          f"(<=4 concurrent batches) + Redis cache + circuit breaker")
 
     s = cache.stats()
     if s["connected"]:
@@ -151,7 +168,12 @@ async def startup():
     else:
         print("[startup] WARNING: Redis not reachable — cache disabled")
 
-    print("[startup] Prometheus metrics available at http://127.0.0.1:8000/metrics")
+    # Path only, not a full URL. This used to print
+    # "http://127.0.0.1:8000/metrics", which is wrong from inside a container:
+    # 127.0.0.1 there is the container, and Prometheus reaches this over the
+    # compose network as http://app:8000/metrics while a developer reaches it
+    # via the published port. The path is the part that is true everywhere.
+    print("[startup] Prometheus metrics exposed at /metrics")
 
 
 @app.on_event("shutdown")
@@ -172,6 +194,10 @@ def health():
         "backend" : f"{BATCHER_BACKEND} (batcher)",
         "onnx_available": ONNX_AVAILABLE,
         "cache"   : cache.stats(),
+        # status() is sync and side-effect-free apart from applying the
+        # time-based OPEN -> HALF_OPEN transition, so polling this endpoint
+        # cannot consume the single recovery probe.
+        "circuit_breaker": batcher.circuit_breaker.status() if batcher else {},
     }
 
 

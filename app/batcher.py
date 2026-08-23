@@ -17,17 +17,24 @@ batching.
 Now: the collector dispatches each batch as its own task and only blocks when
 max_concurrent_batches are already running, which is real backpressure
 instead of a hard serial bottleneck.
+
+Phase 7a — a circuit breaker now guards the model call. The gate is in
+predict(), *before* the queue, and the outcome is recorded in _run_batch() where
+it is actually known. See app/circuit_breaker.py for why permission and outcome
+are separate calls rather than a call() wrapper around the model.
 """
 
 import asyncio
 import time
 
+from app.circuit_breaker import CircuitBreaker
 from app.metrics import batch_size_histogram, model_inference_seconds
 
 
 class InferenceBatcher:
     def __init__(self, predict_fn, batch_size: int = 8, timeout_ms: int = 20,
-                 max_concurrent_batches: int = 4):
+                 max_concurrent_batches: int = 4,
+                 circuit_breaker: CircuitBreaker | None = None):
         self.predict_fn = predict_fn
         self.batch_size = batch_size
         self.timeout_s  = timeout_ms / 1000
@@ -39,6 +46,11 @@ class InferenceBatcher:
         # on this 12-core box: enough to saturate it without thrashing.
         # Raising this past cpu_count/2 trades latency for no extra throughput.
         self.max_concurrent_batches = max_concurrent_batches
+
+        # Injectable so tests can drive a fast breaker (threshold 2, sub-second
+        # cooldown) against a deliberately failing predict_fn without touching
+        # this file. Defaults to a real one so the class still works standalone.
+        self.circuit_breaker = circuit_breaker or CircuitBreaker()
 
         self._sem         = asyncio.Semaphore(max_concurrent_batches)
         self._inflight    = set()
@@ -56,6 +68,14 @@ class InferenceBatcher:
             await asyncio.gather(*self._inflight, return_exceptions=True)
 
     async def predict(self, text: str) -> dict:
+        # Circuit breaker gate, before the queue. Everything past this line costs
+        # a queue slot, up to timeout_s in the collection window, and a semaphore
+        # permit — so rejecting here is the difference between a rejection that
+        # costs a branch and one that costs 20ms and still grows the backlog.
+        # Raises CircuitOpenError, a RuntimeError subclass, which main.py's
+        # /predict already turns into a 503.
+        self.circuit_breaker.check()
+
         future = asyncio.get_running_loop().create_future()
         await self.queue.put((text, future))
         return await future
@@ -110,10 +130,21 @@ class InferenceBatcher:
                     f"predict_fn returned {len(results)} results for "
                     f"{len(futures)} inputs"
                 )
+
+            # After the arity check, not before: a backend that returns the wrong
+            # number of rows has violated its contract, and that is a backend
+            # failure like any other.
+            self.circuit_breaker.record_success()
+
             for future, result in zip(futures, results):
                 if not future.done():
                     future.set_result(result)
         except Exception as exc:
+            # asyncio.CancelledError is a BaseException, so it does NOT land here
+            # — which is what we want. The only thing that cancels a batch is
+            # stop() at shutdown, and that must not be counted as the model
+            # failing. Do not widen this to BaseException.
+            self.circuit_breaker.record_failure()
             for future in futures:
                 if not future.done():
                     future.set_exception(exc)

@@ -14,7 +14,7 @@ prometheus-fastapi-instrumentator. In Grafana, prefix all queries with
 "ml_" to find custom metrics quickly.
 """
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 # ── Cache metrics ────────────────────────────────────────────────────────────
 cache_hits = Counter(
@@ -42,4 +42,26 @@ model_inference_seconds = Histogram(
     buckets=[0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5]
     # Buckets match observed range: ~20-50ms on Intel i5.
     # 0.005 = 5ms lower bound, 0.5 = 500ms upper bound for outliers.
+)
+
+# ── Circuit breaker metrics — Phase 7a ───────────────────────────────────────
+circuit_breaker_state = Gauge(
+    "ml_circuit_breaker_state",
+    "Model-path circuit breaker: 0=closed, 1=half_open, 2=open"
+    # A Gauge because this is current state, not an accumulating count — the
+    # convention this file's header describes. Encoded by severity so a panel
+    # reads as "higher is worse" without needing a value mapping.
+    #
+    # /health reports the same thing, but only when something polls it. A
+    # breaker that opened and recovered between two polls leaves no trace there,
+    # which is the exact class of invisible event phase 5 existed to fix.
+)
+
+circuit_breaker_rejections = Counter(
+    "ml_circuit_breaker_rejections",
+    "Requests fast-failed at admission because the breaker was open"
+    # Distinct from the 503s in http_requests_total: a request rejected here
+    # never reached the model, so it is load shed on purpose rather than a
+    # server error. Rate of this against the request rate is the "how much
+    # traffic are we dropping" signal.
 )
