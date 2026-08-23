@@ -5,10 +5,12 @@ predictions over HTTP: request batching, ONNX INT8 quantization, Redis
 caching, and Prometheus/Grafana metrics — each phase measured before the
 next was added.
 
-Phases 1–2 below are the original build notes. **Phase 6 documents three
+Phases 1–2 below are the original build notes. **Phase 6 documents four
 findings from phases 3–5 that turned out to be measurement artifacts**, and
 what the harness now prints so they cannot recur; read it before trusting
-any number in the earlier sections.
+any number in the earlier sections. Phase 5 gets the same treatment for the
+Grafana dashboard, where four of the five panel values turn out to be
+properties of the PromQL query rather than of the server.
 
 ## Phase 1: baseline
 
@@ -208,13 +210,177 @@ baseline**, cross-checked against the server's own hit/miss counters from
 
 ## Phase 5: Prometheus + Grafana
 
-`/metrics` exposes request counts, latency histograms, cache hit/miss
-counters, and a `batch_size_histogram`.
+`/metrics` exposes the HTTP metrics that `prometheus-fastapi-instrumentator`
+adds automatically, plus four custom ones from `app/metrics.py`:
+
+| Metric | Type | Observed at |
+|---|---|---|
+| `ml_cache_hits` / `ml_cache_misses` | Counter | `app/cache.py:79`, `:81`, `:84` |
+| `ml_batch_size` | Histogram, buckets `1,2,4,8,16,32` | `app/batcher.py:101` |
+| `ml_model_inference_seconds` | Histogram, buckets 5 ms–500 ms | `app/batcher.py:106` |
+
+The last two are observed **inside the batcher, once per batch**. So they
+describe batches rather than requests, and they are blind to everything the
+cache served and to both unbatched endpoints.
 
 ```bash
-docker compose up -d          # prometheus + grafana
-# Grafana at localhost:3000, Prometheus at localhost:9090
+docker compose -f docker-compose.monitoring.yml up -d
+# Grafana at localhost:3000 (admin/admin), Prometheus at localhost:9090
 ```
+
+Prometheus runs in Docker and the server does not, so `prometheus.yml`
+targets `host.docker.internal:8000` rather than `localhost` — inside a
+container `localhost` is the container. Scrape interval 15 s, retention 7 d.
+Target health over the retained window: **511 scrapes, up, mean scrape
+duration 8.97 ms** (max 185 ms, on the cold first scrape). Serving `/metrics`
+costs the server 5.11 ms, or 0.03% of a 15-second interval.
+
+### The session behind these numbers
+
+Two `load_test.py` runs, ~01:31 and ~01:37. Each run is four arms of 200
+requests at concurrency 50, plus five cache-priming requests. Read straight
+off the counters:
+
+| Handler | Requests | Mean latency |
+|---|---|---|
+| `/predict` | 810 | 22.98 ms |
+| `/predict_onnx_unbatched` | 400 | 68.47 ms |
+| `/predict_unbatched` | 400 | 522.51 ms |
+| `/metrics` | 81 | 5.11 ms |
+| `/health` | 2 | 3.91 ms |
+| **total** | **1693 — every one 2xx** | 150.87 ms |
+
+Pooled across all 1693 requests (`http_request_duration_highr_seconds`, which
+has fine buckets but no `handler` label): p50 31.0 ms, p95 646.9 ms, p99
+1344.5 ms. That spread is the four arms sitting on top of each other, not
+variance within any one path.
+
+Two counters carry the whole batching-and-caching story:
+
+- 810 `/predict` requests → **50 cache misses → 7 model forward passes.**
+  116 requests per forward pass.
+- Run 1's cold arm released 200 requests at once against an empty cache, so
+  the first 50 — exactly `CONCURRENCY` — missed before any cache write
+  landed. Those 50 items became the 7 batches. Run 2 missed zero times, so
+  the batcher never ran again.
+
+Every batching and inference number on the dashboard therefore rests on
+**7 observations, formed from one burst of 50 requests.**
+
+### Reading the panels
+
+The five panel values and what each is actually made of. The queries below
+reproduce the plotted values exactly.
+
+**Cache Hit Rate — panel 87.65%, session 93.8%.** The query is
+`rate(ml_cache_hits_total[5m]) / (rate(ml_cache_hits_total[5m]) + rate(ml_cache_misses_total[5m])) * 100`.
+That 5-minute window contained all 50 misses but only 355 of the 760 hits:
+355/405 = 87.65%. Cumulative for the session it is 760/810 = **93.8%**, and
+the model ran for **6.2%** of `/predict` requests, not the 12.3% the windowed
+figure implies. Both are correct; they answer different questions, and a rate
+window straddling a cold start answers neither cleanly. Neither contradicts
+Phase 4's ~73% — that is `test_cache.py`'s 5-text rotation, a different
+traffic shape from a 200-request burst over 5 keys.
+
+**Batch Size p95 = 7.80 is arithmetic, not measurement.** All 7 batches
+landed in the `(4, 8]` bucket, and `histogram_quantile` interpolates linearly
+inside it: `4 + 4 × 0.95 = 7.8`. It prints 7.80 if every batch held 5 items
+and 7.80 if every batch held 8 — once every observation lands in one bucket,
+the value is fixed by the bucket edges `[1,2,4,8,16,32]` and the percentile
+alone. What the histogram does support: 7 batches, 50 items, **mean 7.14**,
+none of them ≤ 4. For batch size, `ml_batch_size_sum / ml_batch_size_count` is
+a real number; the p95 of a six-bucket histogram is not.
+
+**Model Inference p99 = 74.4 ms is a bucket edge, and it is per batch.** Same
+mechanism: 4 of the 7 observations fall in `(25, 50] ms` and 3 in
+`(50, 75] ms`, so `0.05 + 0.025 × (6.93 − 4)/3 = 0.0744`. The p99 of 7 samples
+sits 97.7% of the way through the highest occupied bucket by construction —
+it is the bucket edge, not the slowest call. The measurable
+figure is the mean — 343.6 ms / 7 = **49.1 ms per batch** — and at 7.14 items
+per batch that is **6.9 ms per item**, consistent with the 8.2 ms
+single-request INT8 number below, not with a 74 ms model call. Quoting 74 ms
+as the model's per-request cost overstates it by ~10x.
+
+**Latency Percentiles: the per-handler histogram has three buckets.**
+`prometheus-fastapi-instrumentator` defaults to
+`latency_lowr_buckets = (0.1, 0.5, 1)` for `http_request_duration_seconds`
+(`instrumentation.py:201`); the fine buckets go to
+`http_request_duration_highr_seconds`, which has no `handler` label. So every
+per-handler percentile is an interpolation between 0 and 100 ms, 100 and
+500 ms, or 500 ms and 1 s. At the instant the screenshots were taken:
+
+| Handler | p50 | p95 | p99 | mean |
+|---|---|---|---|---|
+| `/metrics` | 50 ms | 95 ms | 99 ms | 5.11 ms |
+| `/predict` | 50 ms | 95 ms | 99 ms | 22.98 ms |
+| `/predict_unbatched` | 369 ms | 902 ms | 980 ms | 522.51 ms |
+
+`/predict` and `/metrics` plot **identical lines** — 50/95/99 ms — because
+both finish inside the first bucket, so the histogram cannot tell a 1 ms
+cache hit from a 99 ms one. Any reading of this panel that has `/metrics`
+"near 0 ms" while `/predict` shows cache-plus-inference is reporting a
+difference the buckets cannot represent: the two series are drawn on top of
+each other. `/predict_unbatched`'s 902/980 ms are interpolations inside one
+500 ms-wide bucket — all the histogram knows is "between 0.5 s and 1 s." Over
+the full session 50 of its 400 requests (12.5%) exceeded 1 s, putting its
+session p95 and p99 past the last finite bucket, where `histogram_quantile`
+can only return 1.0.
+
+**Request Rate 1.75 req/s, against ~96 req/s actual.**
+`rate(http_requests_total{handler="/predict_unbatched"}[1m])` peaks at
+**1.748** at 01:31:30 — the plotted value. That arm sent 200 requests; at
+522.51 ms mean latency and concurrency 50, Little's law puts real throughput
+at 50 / 0.5225 ≈ **96 req/s**, so the burst lasted about 2 seconds. `rate()`
+divides the counter increase by the **window**, not by the burst, so a
+2-second burst inside a 60-second window is averaged down ~55x. The 15 s
+scrape interval compounds it: a 2 s burst is a single counter jump, and no
+rate window can recover its shape. Peak throughput has to come from the load
+harness, which times it directly. (`histogram_quantile` is not the fix — it
+does not apply to counters.)
+
+**The flat lines are the rate window, not stability.** Every panel in the
+screenshots holds one value dead flat for five minutes and is empty for the
+other 5h 55m. That is a 5-minute rate window republishing a single scrape's
+delta at every step until the delta ages out. There is one measurement per
+panel, so a flat line here cannot show that the model is not degrading, that
+there is no memory leak, or that there is no thermal throttling. Phase 6's
+E-core finding — one identical PyTorch call recorded at 17.8 ms in one phase
+and 31.7 ms in another — is exactly the drift this chart is too sparse to
+see.
+
+### What the dashboard did establish
+
+None of the above is an argument against the dashboard. Four of its findings
+survive scrutiny, and they are the ones that come from counters rather than
+from quantiles:
+
+- **1693 requests, 1693 2xx.** No silent failures on any path, including the
+  ONNX batch path Phase 6 had to fix.
+- **810 requests served by 7 forward passes.** The cache and the batcher
+  compose: the cache removed 93.8% of the work, the batcher folded what was
+  left into 7 calls. Measured in production traffic, not inferred from a
+  benchmark.
+- **The batcher fills under burst load** — mean 7.14 against a cap of 8, from
+  50 requests released simultaneously. It says nothing about steady state,
+  where Phase 6 measured batching as a 1.00x wash on this CPU.
+- **The target is scrapeable and cheap**, and `up` goes to 0 the moment the
+  server stops — the one signal here that needs no interpretation.
+
+### What to change before trusting the panels again
+
+1. Widen `latency_lowr_buckets`. The default three cannot separate any two
+   paths in this project; a cache hit and a saturated PyTorch call are three
+   orders of magnitude apart. Roughly
+   `(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5)`.
+2. Add buckets between 1 and 8 to `ml_batch_size`, or drop the p95 and plot
+   `ml_batch_size_sum / ml_batch_size_count`.
+3. Plot `ml_model_inference_seconds_sum / ml_batch_size_sum` for per-item
+   cost, since the histogram observes batches.
+4. Drive load for longer than the rate window before reading the rate panel,
+   or read throughput from the harness.
+5. Put `ml_batch_size_count` and `ml_model_inference_seconds_count` on the
+   dashboard beside every percentile derived from them. A p99 over 7 samples
+   should look wrong at a glance.
 
 ## Phase 6: fixing the benchmarks — four wrong conclusions
 
@@ -406,6 +572,17 @@ spread, server-side *and* client-side latency, a queueing sanity check, and
 which code path actually served each request. Where a script used to assert
 a cause, it lists what to check.
 
+The Grafana dashboard in Phase 5 is the same failure mode with a different
+mechanism. Nothing there is mismeasured — the counters are exact — but four
+of the five panels report a *quantile*, and a quantile inherits the shape of
+its bucket layout and its rate window. 7.80 batch-p95 and 74.4 ms
+inference-p99 are both bucket-edge arithmetic over 7 samples; the 50/95/99 ms
+latency lines are the first bucket's edges; 1.75 req/s is a 2-second burst
+divided by a 60-second window. The numbers that held up — 1693/1693 2xx, 810
+requests served by 7 forward passes, 93.8% cumulative hit rate — are all
+counters and ratios of counters. A dashboard makes a system observable; it
+does not make its own readings true.
+
 ### Current numbers, all verified on this box
 
 | Path | server-side p50 | note |
@@ -416,9 +593,26 @@ a cause, it lists what to check.
 | Cache hit | 0.85 ms | ~10x vs inference |
 | Model size | 256.1 → 64.7 MB | 4.0x smaller |
 
+From the Grafana session (two `load_test.py` runs, 1693 requests, all 2xx) —
+counter-derived figures only, since the quantile panels are bucket artifacts:
+
+| Measure | Value | Source |
+|---|---|---|
+| Cache hit rate, cumulative | 93.8% | 760 hits / 810 `/predict` |
+| Forward passes for 810 requests | 7 | `ml_batch_size_count` |
+| Mean batch size | 7.14 / cap 8 | `ml_batch_size_sum / _count` |
+| Model inference, per batch | 49.1 ms | `_sum / _count`, 7 batches |
+| Model inference, per item | 6.9 ms | 49.1 / 7.14 |
+| `/predict` mean, end to end | 22.98 ms | 810 requests |
+| `/predict_onnx_unbatched` mean | 68.47 ms | 400 requests, 50-way load |
+| `/predict_unbatched` mean | 522.51 ms | 400 requests, 50-way load |
+| Errors | 0 / 1693 | `http_requests_total` by status |
+
 ### Running everything
 
 ```bash
+docker run -d -p 6379:6379 --name redis-ml redis:alpine
+docker compose -f docker-compose.monitoring.yml up -d
 uvicorn app.main:app --reload
 ```
 
@@ -429,4 +623,12 @@ python load_test.py               # concurrency: uncached, cold cache, warm cach
 python load_test_nocache.py       # batching in isolation, cache bypassed
 python test_cache.py              # cache hit rate + relative speedup
 ```
+
+The dashboard panels only carry signal while load is running, and a full
+four-arm `load_test.py` run is over in about 30 seconds — two or three
+scrapes, of which 9 s is the deliberate `SETTLE_S` idling between arms. That
+is shorter than the 1-minute rate window on the request-rate panel and far
+shorter than the 5-minute window on the rest. To read anything time-varying
+off Grafana, loop the load test for longer than the widest rate window
+first.
 
