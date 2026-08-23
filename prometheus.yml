@@ -5,9 +5,15 @@ global:
 scrape_configs:
   - job_name: "ml-inference-server"
     static_configs:
-      # host.docker.internal resolves to the Windows host machine IP
-      # from inside a Docker container. This is how Prometheus (running
-      # in Docker) reaches FastAPI (running locally on port 8000).
-      # Do NOT use localhost here — that would mean the container itself.
-      - targets: ["host.docker.internal:8000"]
+      # Phase 7: the server runs in Docker now, so this is the compose service
+      # name resolved over the shared network. Before phase 7 the app was on the
+      # host and this had to be host.docker.internal:8000 — a workaround for the
+      # split deployment, not something Prometheus needed.
+      #
+      # If you go back to running uvicorn on the host (e.g. `uvicorn
+      # app.main:app --reload` for a fast edit loop) while keeping Prometheus in
+      # Docker, swap the target for the commented line below. localhost is wrong
+      # in both cases: inside a container it means the container.
+      - targets: ["app:8000"]
+      # - targets: ["host.docker.internal:8000"]   # app running on the host
     metrics_path: "/metrics"

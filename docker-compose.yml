@@ -1,0 +1,93 @@
+# Phase 7 — the whole stack in one file.
+#
+# Before this, running the project meant three separate things: `docker run` for
+# Redis, `docker compose -f docker-compose.monitoring.yml up` for Prometheus and
+# Grafana, and `uvicorn app.main:app` on the host. The app being outside Docker
+# is why prometheus.yml used to scrape host.docker.internal.
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f app
+#   docker compose down
+#
+# No top-level `version:` key — it has been obsolete since Compose v2 and
+# current Compose warns about it.
+#
+# No container_name on any service either, so Compose namespaces them
+# (ml-inference-server-app-1, ...). Fixed names would collide with anything left
+# running from the pre-phase-7 setup, and would block a second stack on another
+# branch.
+
+services:
+  # ── Cache ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      # Published so host-run scripts (test_cache.py reads the server's own
+      # counters, but redis-cli is handy) can reach it. Nothing here needs
+      # persisting: app/cache.py writes with a 1-hour TTL and the cache fails
+      # open, so a cold Redis costs one forward pass per key.
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Inference server ───────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # app/cache.py:35 already reads REDIS_URL from the environment, so this is
+      # the only wiring the move into Docker needs. "redis" is the service name,
+      # resolved on the default compose network.
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        # Wait for PONG, not just for the container to exist. The cache fails
+        # open, so starting early would not error — it would just log
+        # "WARNING: Redis not reachable" and serve every request from the model,
+        # which is a performance regression that looks like a healthy server.
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Metrics ────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  # ── Dashboards ─────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      # Named volume so hand-built panels and the datasource survive
+      # `docker compose down`. Without it every teardown means rebuilding the
+      # dashboard by hand. Provisioning them from files is the better answer and
+      # is not in this phase.
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  grafana-data:

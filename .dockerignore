@@ -1,0 +1,58 @@
+# Build context exclusions.
+#
+# Without this file the context includes venv/ (multi-GB) and models/ (320 MB),
+# both of which get uploaded to the daemon on every build for no reason.
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Generated models ─────────────────────────────────────────────────────────
+# Excluded deliberately, for two reasons. It keeps 320 MB out of the context,
+# and it stops the host's graphs from shadowing the ones the builder stage
+# produces — the image must be built from export_onnx.py's output, not from
+# whatever happens to be sitting in the working tree. models/ is gitignored, so
+# a clean clone has nothing here anyway; excluding it means the local build and
+# the clean-clone build take the same path.
+models/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# ── Caches ───────────────────────────────────────────────────────────────────
+.cache/
+huggingface/
+
+# ── VCS and tooling ──────────────────────────────────────────────────────────
+.git/
+.gitignore
+.vscode/
+.claude/
+.report_build/
+node_modules/
+.ipynb_checkpoints/
+
+# ── Local env and logs ───────────────────────────────────────────────────────
+.env
+.env.*
+*.log
+
+# ── Not needed at build or runtime ───────────────────────────────────────────
+# The benchmark and load-test scripts run from the host against the published
+# port; they are not part of the served application.
+benchmark_batch_sizes.py
+benchmark_onnx.py
+load_test.py
+load_test_nocache.py
+test_cache.py
+test_requests.py
+docker-compose.yml
+Dockerfile
+README.md
+LICENSE

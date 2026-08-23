@@ -71,3 +71,13 @@ models/
 .claude/
 .report_build/
 node_modules/
+
+# ==========================
+# Grafana
+# ==========================
+# One-off backup taken during the phase 7 migration: the pre-phase-7 grafana
+# container had no volume, so its dashboard lived in the container's writable
+# layer and would have been lost on `docker rm`. The dashboard and datasource
+# were re-imported into the named volume the compose file now mounts, so this
+# directory is a local safety net, not something the project needs.
+.grafana-backup/
