@@ -66,3 +66,8 @@ models/
 # Mypy
 # ==========================
 .mypy_cache/
+
+# AI / local tooling
+.claude/
+.report_build/
+node_modules/
