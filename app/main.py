@@ -84,7 +84,7 @@ from app.circuit_breaker import CircuitBreaker
 from app import cache
 
 # ── App setup ────────────────────────────────────────────────────────────────
-app = FastAPI(title="ML Inference Server", version="0.6.0")
+app = FastAPI(title="ML Inference Server", version="0.7.0")
 
 # Auto-instrument all endpoints — adds request count, latency histograms,
 # and status code breakdown to /metrics with 4 lines of code.
@@ -187,7 +187,7 @@ async def shutdown():
 def health():
     return {
         "status"  : "ok",
-        "version" : "0.6.0",
+        "version" : "0.7.0",
         # Reports what the batcher actually resolved to at startup rather than
         # a hardcoded string. The old value claimed ONNX was "unbatched only",
         # which stopped being true once the export was fixed.
