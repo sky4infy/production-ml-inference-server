@@ -1,5 +1,8 @@
 # ML Inference Server
 
+An ML inference server is a system that hosts a trained machine-learning model and exposes it through an API so applications can send input data and receive predictions in real time.
+
+Project:
 Production-shaped sentiment inference on CPU: ONNX INT8, request batching, Redis cache-aside, Prometheus metrics, and a circuit breaker — with every performance claim measured rather than assumed.
 
 ![Python](https://img.shields.io/badge/python-3.13-blue)
